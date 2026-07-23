@@ -27,8 +27,6 @@ async function sendWhatsAppMessage(data, senderPhoneId = phone_number_id) {
         console.log("[sendWhatsAppMessage] SUCCESS:", JSON.stringify(response.data));
         return response;
     } catch (error) {
-        // This is the most important log in the whole file right now.
-        // error.response.data contains WhatsApp's exact reason for rejecting the request.
         console.error("[sendWhatsAppMessage] FAILED. Full error from Meta:",
             JSON.stringify(error.response ? error.response.data : error.message, null, 2)
         );
@@ -83,6 +81,32 @@ function getOptionReply(optionId) {
     return replies[optionId] || "Sorry, I didn't recognize that option.";
 }
 
+/**
+ * THE ACTION STEP of the workflow.
+ * Takes an already-parsed incoming message and decides what to send back.
+ * This is deliberately separate from the webhook route so it can be
+ * triggered either by a real WhatsApp event OR by a manual test call.
+ */
+async function processIncomingMessage(message, from, phon_no_id) {
+    console.log("[processIncomingMessage] type:", message.type, "| from:", from, "| phone_number_id:", phon_no_id);
+
+    if (message.type === "interactive" && message.interactive?.type === "list_reply") {
+        const selectedId = message.interactive.list_reply?.id;
+        console.log("[processIncomingMessage] User selected:", selectedId);
+        const replyText = getOptionReply(selectedId);
+        return sendText(from, replyText, phon_no_id);
+    }
+
+    if (message.type === "text" && message.text) {
+        const msg_body = message.text.body;
+        console.log("[processIncomingMessage] Incoming text:", msg_body);
+        return sendText(from, "Hi.. I'm Prasath, your message is " + msg_body, phon_no_id);
+    }
+
+    console.log("[processIncomingMessage] Unhandled message type, nothing sent:", message.type);
+    return null;
+}
+
 //to verify the callback url from dashboard side - cloud api side
 app.get("/webhook", (req, res) => {
     let mode = req.query["hub.mode"];
@@ -98,69 +122,85 @@ app.get("/webhook", (req, res) => {
     }
 });
 
+/**
+ * THE TRIGGER STEP of the workflow.
+ * Only responsible for: receiving the raw payload, extracting the message,
+ * and handing it off to processIncomingMessage.
+ */
 app.post("/webhook", async (req, res) => {
-    // Respond to WhatsApp immediately so it never times out / retries mid-processing.
-    res.sendStatus(200);
+    res.sendStatus(200); // ack immediately, don't make WhatsApp wait on our processing
 
     try {
-        let body_param = req.body;
+        const body_param = req.body;
         console.log("[webhook] RAW PAYLOAD:", JSON.stringify(body_param, null, 2));
 
         if (!body_param.object) {
-            console.log("[webhook] No 'object' field — ignoring payload.");
+            console.log("[webhook] No 'object' field — ignoring.");
             return;
         }
 
-        // Use optional chaining so a shape mismatch logs instead of crashing.
         const value = body_param.entry?.[0]?.changes?.[0]?.value;
         const message = value?.messages?.[0];
 
         if (!value || !message) {
-            console.log("[webhook] No message found in payload (likely a status update, e.g. 'delivered'/'read'). Ignoring.");
+            console.log("[webhook] No message in payload (likely a status update). Ignoring.");
             return;
         }
 
         const phon_no_id = value.metadata?.phone_number_id;
         const from = message.from;
 
-        console.log("[webhook] phone_number_id:", phon_no_id);
-        console.log("[webhook] from:", from);
-        console.log("[webhook] message.type:", message.type);
-        console.log("[webhook] full message object:", JSON.stringify(message, null, 2));
-
-        // Case 1: user tapped an option from the interactive list
-        if (message.type === "interactive") {
-            const interactiveType = message.interactive?.type;
-            console.log("[webhook] interactive.type:", interactiveType);
-
-            if (interactiveType === "list_reply") {
-                const selectedId = message.interactive.list_reply?.id;
-                console.log("[webhook] User selected option id:", selectedId);
-
-                await sendText(from, getOptionReply(selectedId), phon_no_id);
-                console.log("[webhook] Option reply sent successfully.");
-                return;
-            }
-
-            console.log("[webhook] Interactive message received but type wasn't 'list_reply':", interactiveType);
-            return;
-        }
-
-        // Case 2: normal text message
-        if (message.type === "text" && message.text) {
-            const msg_body = message.text.body;
-            console.log("[webhook] Incoming text body:", msg_body);
-
-            await sendText(from, "Hi.. I'm Prasath, your message is " + msg_body, phon_no_id);
-            console.log("[webhook] Text reply sent successfully.");
-            return;
-        }
-
-        console.log("[webhook] Unhandled message type — nothing sent:", message.type);
+        await processIncomingMessage(message, from, phon_no_id);
 
     } catch (err) {
-        // Catch-all so nothing dies silently.
         console.error("[webhook] UNEXPECTED ERROR:", err.response ? JSON.stringify(err.response.data, null, 2) : err.message);
+    }
+});
+
+/**
+ * NEW: Manual "check reply and send message back" route — this is what lets you
+ * test the reply logic directly, bypassing WhatsApp's webhook delivery entirely.
+ *
+ * Usage examples:
+ * GET /simulate-reply?type=list_reply&optionId=expo_location&from=919038580461
+ * GET /simulate-reply?type=text&text=Hello&from=919038580461
+ */
+app.get("/simulate-reply", async (req, res) => {
+    const { type, optionId, text, from, phone_number_id: overridePhoneId } = req.query;
+    const senderPhoneId = overridePhoneId || phone_number_id;
+
+    if (!from) {
+        return res.status(400).send("Missing 'from' query param (the number to reply to).");
+    }
+
+    let fakeMessage;
+    if (type === "list_reply") {
+        if (!optionId) return res.status(400).send("Missing 'optionId' query param.");
+        fakeMessage = {
+            type: "interactive",
+            interactive: { type: "list_reply", list_reply: { id: optionId } }
+        };
+    } else if (type === "text") {
+        fakeMessage = {
+            type: "text",
+            text: { body: text || "Hello" }
+        };
+    } else {
+        return res.status(400).send("Invalid or missing 'type'. Use 'list_reply' or 'text'.");
+    }
+
+    try {
+        const result = await processIncomingMessage(fakeMessage, from, senderPhoneId);
+        res.status(200).json({
+            status: "sent",
+            simulated_input: fakeMessage,
+            api_response: result?.data || null
+        });
+    } catch (error) {
+        res.status(500).json({
+            status: "failed",
+            error: error.response ? error.response.data : error.message
+        });
     }
 });
 
