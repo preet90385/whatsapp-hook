@@ -7,17 +7,17 @@ const app = express().use(body_parser.json());
 
 const token = process.env.TOKEN;
 const mytoken = process.env.MYTOKEN; //pratham_token
-const phone_number_id = process.env.PHONE_NUMBER_ID; // needed for routes not triggered by webhook
+const phone_number_id = process.env.PHONE_NUMBER_ID; // fallback, used for routes not triggered by webhook
 
 app.listen(process.env.PORT, () => {
     console.log("webhook is listening");
 });
 
 /** Core sender - posts any message payload to the WhatsApp Cloud API. */
-function sendWhatsAppMessage(data) {
+function sendWhatsAppMessage(data, senderPhoneId = phone_number_id) {
     return axios({
         method: "POST",
-        url: "https://graph.facebook.com/v13.0/" + phone_number_id + "/messages?access_token=" + token,
+        url: "https://graph.facebook.com/v13.0/" + senderPhoneId + "/messages?access_token=" + token,
         data,
         headers: {
             "Content-Type": "application/json"
@@ -26,17 +26,17 @@ function sendWhatsAppMessage(data) {
 }
 
 /** Send a plain text message. */
-function sendText(to, text) {
+function sendText(to, text, senderPhoneId) {
     return sendWhatsAppMessage({
         messaging_product: "whatsapp",
         to,
         type: "text",
         text: { body: text },
-    });
+    }, senderPhoneId);
 }
 
 /** Send the interactive list with the 3 demo options. */
-function sendOptionsList(to) {
+function sendOptionsList(to, senderPhoneId) {
     return sendWhatsAppMessage({
         messaging_product: "whatsapp",
         to,
@@ -59,7 +59,7 @@ function sendOptionsList(to) {
                 ],
             },
         },
-    });
+    }, senderPhoneId);
 }
 
 /** Reply text for each list option id. */
@@ -99,8 +99,13 @@ app.post("/webhook", (req, res) => {
             body_param.entry[0].changes[0].value.messages &&
             body_param.entry[0].changes[0].value.messages[0]
         ) {
-            let message = body_param.entry[0].changes[0].value.messages[0];
+            let value = body_param.entry[0].changes[0].value;
+            let phon_no_id = value.metadata.phone_number_id; // always use the ID from the incoming payload
+            let message = value.messages[0];
             let from = message.from;
+
+            console.log("phone number " + phon_no_id);
+            console.log("from " + from);
 
             // Case 1: user tapped an option from the interactive list
             if (message.type === "interactive" &&
@@ -110,7 +115,8 @@ app.post("/webhook", (req, res) => {
                 let selectedId = message.interactive.list_reply.id;
                 console.log("User selected option: " + selectedId);
 
-                sendText(from, getOptionReply(selectedId))
+                sendText(from, getOptionReply(selectedId), phon_no_id)
+                    .then(r => console.log("Reply sent:", r.data))
                     .catch(err => console.error("Error sending option reply:", err.response ? err.response.data : err.message));
 
                 return res.sendStatus(200);
@@ -119,11 +125,10 @@ app.post("/webhook", (req, res) => {
             // Case 2: normal text message
             if (message.text) {
                 let msg_body = message.text.body;
-
-                console.log("from " + from);
                 console.log("body param " + msg_body);
 
-                sendText(from, "Hi.. I'm Prasath, your message is " + msg_body)
+                sendText(from, "Hi.. I'm Prasath, your message is " + msg_body, phon_no_id)
+                    .then(r => console.log("Reply sent:", r.data))
                     .catch(err => console.error("Error sending text reply:", err.response ? err.response.data : err.message));
 
                 return res.sendStatus(200);
