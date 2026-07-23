@@ -1,0 +1,25 @@
+{
+  "name": "whatsapp-webhook",
+  "version": "1.0.0",
+  "description": "WhatsApp Cloud API webhook using Express.js",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "keywords": [
+    "whatsapp",
+    "webhook",
+    "express",
+    "meta",
+    "cloud-api"
+  ],
+  "author": "Pratham Roy",
+  "license": "ISC",
+  "dependencies": {
+    "axios": "^1.16.0",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1"
+  }
+}
