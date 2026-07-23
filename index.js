@@ -221,10 +221,10 @@
 //     res.status(200).send("hello this is webhook setup");
 // });
 
-
 const express = require("express");
 const body_parser = require("body-parser");
 const axios = require("axios");
+const { createClient } = require("@supabase/supabase-js");
 require('dotenv').config();
 
 const app = express().use(body_parser.json());
@@ -232,19 +232,15 @@ const app = express().use(body_parser.json());
 const token = process.env.TOKEN;
 const mytoken = process.env.MYTOKEN; //pratham_token
 const phone_number_id = process.env.PHONE_NUMBER_ID;
-const PROCESS_WEBHOOK_URL = process.env.PROCESS_WEBHOOK_URL; // optional: forward selection JSON elsewhere
+
+const supabase = createClient(
+    process.env.SUPABASE_URL,
+    process.env.SUPABASE_SERVICE_ROLE_KEY
+);
 
 app.listen(process.env.PORT, () => {
     console.log("webhook is listening");
 });
-
-/**
- * IMPORTANT CAVEAT: This is an in-memory store. On Vercel (serverless),
- * each function invocation may run in a fresh container, so this data
- * can be wiped between requests. Fine for local/dev testing and short-lived
- * demos, but for production you need a real store — see note at bottom.
- */
-const userSelections = {}; // { [from]: [ {optionId, optionTitle, replyText, timestamp}, ... ] }
 
 /** Core sender - posts any message payload to the WhatsApp Cloud API. */
 async function sendWhatsAppMessage(data, senderPhoneId = phone_number_id) {
@@ -312,7 +308,7 @@ function getOptionReply(optionId) {
     return replies[optionId] || "Sorry, I didn't recognize that option.";
 }
 
-/** Human-readable title lookup, so stored data isn't just raw ids. */
+/** Human-readable title lookup. */
 function getOptionTitle(optionId) {
     const titles = {
         expo_location: "Expo Location",
@@ -323,50 +319,34 @@ function getOptionTitle(optionId) {
 }
 
 /**
- * Persists a user's selection and returns the structured JSON record.
- * This is the "further process" hook — anything downstream (a database,
- * analytics, a CRM, another webhook) can consume this object.
+ * Persists a user's selection to Supabase and returns the structured record.
  */
-function recordSelection(from, optionId) {
+async function recordSelection(from, optionId) {
     const record = {
-        from,
-        selectedOptionId: optionId,
-        selectedOptionTitle: getOptionTitle(optionId),
-        replyText: getOptionReply(optionId),
-        timestamp: new Date().toISOString(),
+        from_number: from,
+        selected_option_id: optionId,
+        selected_option_title: getOptionTitle(optionId),
+        reply_text: getOptionReply(optionId),
     };
 
-    if (!userSelections[from]) userSelections[from] = [];
-    userSelections[from].push(record);
+    const { data, error } = await supabase
+        .from("user_selections")
+        .insert(record)
+        .select()
+        .single();
 
-    console.log("[recordSelection] Stored:", JSON.stringify(record));
-    return record;
-}
-
-/**
- * Optional: forward the selection JSON to another system (n8n, Zapier,
- * your own backend, a database API, etc.) if PROCESS_WEBHOOK_URL is set.
- */
-async function forwardSelectionForProcessing(record) {
-    if (!PROCESS_WEBHOOK_URL) return null;
-
-    try {
-        const res = await axios.post(PROCESS_WEBHOOK_URL, record, {
-            headers: { "Content-Type": "application/json" }
-        });
-        console.log("[forwardSelectionForProcessing] Forwarded successfully.");
-        return res.data;
-    } catch (error) {
-        console.error("[forwardSelectionForProcessing] Failed to forward:",
-            error.response ? error.response.data : error.message);
-        return null;
+    if (error) {
+        console.error("[recordSelection] Supabase insert failed:", JSON.stringify(error, null, 2));
+        // Don't block the WhatsApp reply just because the DB write failed
+        return { ...record, saved: false, error: error.message };
     }
+
+    console.log("[recordSelection] Stored in Supabase:", JSON.stringify(data));
+    return { ...data, saved: true };
 }
 
 /**
  * THE ACTION STEP of the workflow.
- * Now returns a structured JSON result describing what happened,
- * not just the WhatsApp API response.
  */
 async function processIncomingMessage(message, from, phon_no_id) {
     console.log("[processIncomingMessage] type:", message.type, "| from:", from, "| phone_number_id:", phon_no_id);
@@ -375,10 +355,8 @@ async function processIncomingMessage(message, from, phon_no_id) {
         const selectedId = message.interactive.list_reply?.id;
         console.log("[processIncomingMessage] User selected:", selectedId);
 
-        const record = recordSelection(from, selectedId);
-        await forwardSelectionForProcessing(record);
-
-        const apiResponse = await sendText(from, record.replyText, phon_no_id);
+        const record = await recordSelection(from, selectedId);
+        const apiResponse = await sendText(from, getOptionReply(selectedId), phon_no_id);
 
         return {
             handled: true,
@@ -422,7 +400,6 @@ app.get("/webhook", (req, res) => {
     }
 });
 
-/** THE TRIGGER STEP of the workflow. */
 app.post("/webhook", async (req, res) => {
     res.sendStatus(200); // ack immediately
 
@@ -454,7 +431,7 @@ app.post("/webhook", async (req, res) => {
     }
 });
 
-/** Manual simulate-reply route, now returns the full structured JSON too. */
+/** Manual simulate-reply route for testing without WhatsApp. */
 app.get("/simulate-reply", async (req, res) => {
     const { type, optionId, text, from, phone_number_id: overridePhoneId } = req.query;
     const senderPhoneId = overridePhoneId || phone_number_id;
@@ -487,15 +464,27 @@ app.get("/simulate-reply", async (req, res) => {
     }
 });
 
-/** NEW: view all stored selections (for debugging / downstream consumption). */
-app.get("/selections", (req, res) => {
-    res.status(200).json(userSelections);
+/** View all stored selections, most recent first. */
+app.get("/selections", async (req, res) => {
+    const { data, error } = await supabase
+        .from("user_selections")
+        .select("*")
+        .order("created_at", { ascending: false });
+
+    if (error) return res.status(500).json({ error: error.message });
+    res.status(200).json(data);
 });
 
-/** NEW: view stored selections for one specific user. */
-app.get("/selections/:from", (req, res) => {
-    const from = req.params.from;
-    res.status(200).json(userSelections[from] || []);
+/** View stored selections for one specific user. */
+app.get("/selections/:from", async (req, res) => {
+    const { data, error } = await supabase
+        .from("user_selections")
+        .select("*")
+        .eq("from_number", req.params.from)
+        .order("created_at", { ascending: false });
+
+    if (error) return res.status(500).json({ error: error.message });
+    res.status(200).json(data);
 });
 
 // Manually trigger a "Hi" + interactive options list to a specific number
